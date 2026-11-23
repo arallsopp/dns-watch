@@ -1,0 +1,59 @@
+name: dns-watch
+
+# Every 5 minutes, check whether WATCH_HOST resolves to TARGET_IP.
+# On the first match: push a notification to ntfy.sh/NTFY_TOPIC, then
+# disable this workflow so it alerts once. Host, IP and topic are repo
+# secrets, and the log never prints DNS answers, because this repo is public.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Send a test notification instead of checking'
+        type: boolean
+        default: false
+
+permissions:
+  actions: write   # lets the job disable itself after it fires
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check DNS
+        env:
+          WATCH_HOST: ${{ secrets.WATCH_HOST }}
+          TARGET_IP: ${{ secrets.TARGET_IP }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GH_TOKEN: ${{ github.token }}
+          TEST: ${{ inputs.test }}
+        run: |
+          set -u
+          notify() {
+            curl -sS -o /dev/null -H "Title: DNS watch" -H "Priority: high" \
+              -H "Tags: rotating_light" -d "$1" "https://ntfy.sh/$NTFY_TOPIC"
+          }
+
+          if [ "$TEST" = "true" ]; then
+            notify "Test: DNS watch is running and can reach you."
+            echo "Test notification sent."
+            exit 0
+          fi
+
+          # Ask two public resolvers directly, so no runner cache gets in the way.
+          answers="$( { dig +short @1.1.1.1 "$WATCH_HOST" A; dig +short @8.8.8.8 "$WATCH_HOST" A; } 2>/dev/null )"
+          if ! printf '%s\n' "$answers" | grep -qxF "$TARGET_IP"; then
+            echo "Not yet."
+            exit 0
+          fi
+
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+          code="$(curl -sS -o /dev/null -m 20 -A "$ua" -w '%{http_code}' "https://$WATCH_HOST/" 2>/dev/null || echo 'no answer')"
+
+          notify "Cutover detected: the watched host now resolves to the target. HTTPS status: $code"
+          echo "Matched. Notification sent; disabling workflow."
+          gh workflow disable dns-watch.yml -R "$GITHUB_REPOSITORY"
